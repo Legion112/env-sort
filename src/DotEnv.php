@@ -44,6 +44,7 @@ class DotEnv
         $diffKeys = array_diff_key($this->mapValueByKey, $base->mapValueByKey);
 
         if (!empty($diffKeys)) {
+            $lines[] = PHP_EOL;
             $lines[] = '# Missing keys in base';
             foreach ($diffKeys as $key => $value) {
                 $lines[] = sprintf('%s=%s', $key, $value);
@@ -52,5 +53,50 @@ class DotEnv
 
         return new DotEnv(implode(PHP_EOL, $lines));
     }
+
+    public function group():self
+    {
+        $groupKeys = [];
+        $lines = $this->lines;
+        foreach ($this->mapValueByKey as $key => $value) {
+            if (!$this->hasGroup($key)){
+                $groupKeys[$key] = [$key];
+                continue;
+            }
+            [$group] = explode('_', $key);
+            if (!array_key_exists($group, $groupKeys)) {
+                $groupKeys[$group] = [];
+            } else {
+                unset($lines[$this->mapKeyLineNumber[$key]]);
+            }
+            $groupKeys[$group][] = $key;
+        }
+
+        foreach ($groupKeys as $keys) {
+            $firstKey = $keys[0];
+            $lineReplacement = [];
+
+            foreach ($keys as $key) {
+                $lineReplacement[] = sprintf('%s=%s', $key, $this->mapValueByKey[$key]);
+            }
+            $lines[$this->mapKeyLineNumber[$firstKey]] = $lineReplacement;
+        }
+        $groupedLines = [];
+        foreach ($lines as $keyValueOrMultipleValues) {
+            if (is_array($keyValueOrMultipleValues)) {
+                array_push($groupedLines, ...$keyValueOrMultipleValues);
+            } else {
+                $groupedLines[] = $keyValueOrMultipleValues;
+            }
+        }
+
+        return new DotEnv(implode(PHP_EOL, $groupedLines));
+    }
+
+    private function hasGroup(string $key):bool
+    {
+        return str_contains($key, '_');
+    }
+
 
 }
