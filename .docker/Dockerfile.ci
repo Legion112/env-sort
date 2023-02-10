@@ -1,4 +1,4 @@
-FROM ghcr.io/softfineware/discriminator-default-normalizer/base:latest as composerdependency
+FROM ghcr.io/softfineware/env-sort/base:latest as composerdependency
 COPY --chown=app:app composer.lock composer.json /app/
 ARG COMPOSER_LOCK_HASH
 ARG COMPOSER_COMMAND="install"
