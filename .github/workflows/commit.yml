@@ -1,0 +1,175 @@
+name: Test commit
+on:
+  push:
+  schedule:
+    - cron: "0 0 * * 4"
+jobs:
+  changed:
+    runs-on: ubuntu-latest
+    outputs:
+      composer: ${{ steps.code.outputs.matched_files }}
+      php: ${{ steps.code.outputs.filtered_diff }}
+      composer-lock-hash: ${{ steps.md5.outputs.composer-lock-hash }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: technote-space/get-diff-action@v6
+        id: code
+        with:
+          PATTERNS: |
+            +(src)/**/*.php
+          FILES: |
+            composer.lock
+      -
+        id: md5
+        run: (printf %s "composer-lock-hash=" >> $GITHUB_OUTPUT && md5sum composer.lock | awk '{ print $1 }' >> $GITHUB_OUTPUT)
+  repository-name:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.repo_slug.outputs.result }}
+    steps:
+      - name: Sanitize repo slug
+        uses: actions/github-script@v6
+        id: repo_slug
+        with:
+          result-encoding: string
+          script: return 'ghcr.io/${{ github.repository }}'.toLowerCase()
+  build-image:
+    strategy:
+      matrix:
+        include:
+          - command: "install"
+            name: "locked"
+          - command: "update --prefer-lowest"
+            name: "lowest"
+          - command: "update"
+            name: "highest"
+    needs: [ changed, repository-name ]
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build dependency Image
+#        if: ${{ needs.changed.outputs.composer }}
+        uses: docker/build-push-action@v3
+        with:
+          target: composerdependency
+          build-args: |
+            COMPOSER_LOCK_HASH=${{needs.changed.outputs.composer-lock-hash}}
+            COMPOSER_COMMAND=${{ matrix.command }}
+          cache-from: ${{ needs.repository-name.outputs.slug}}/dependency-${{ matrix.name }}:${{needs.changed.outputs.composer-lock-hash}}
+          cache-to: ${{ needs.repository-name.outputs.slug}}/dependency-${{ matrix.name }}:${{needs.changed.outputs.composer-lock-hash}}
+          push: true
+          pull: true
+          file: .docker/Dockerfile.ci
+          tags: ${{ needs.repository-name.outputs.slug}}/dependency-${{ matrix.name }}:${{needs.changed.outputs.composer-lock-hash}}
+      -
+        name: Build and push CI Image
+        uses: docker/build-push-action@v3
+        with:
+          build-args: |
+            COMPOSER_LOCK_HASH=${{needs.changed.outputs.composer-lock-hash}}
+            COMPOSER_COMMAND=${{ matrix.command }}
+          cache-from: ${{ needs.repository-name.outputs.slug}}/dependency-${{ matrix.name }}:${{needs.changed.outputs.composer-lock-hash}}
+          push: true
+          file: .docker/Dockerfile.ci
+          tags: ${{ needs.repository-name.outputs.slug}}/${{ matrix.name }}:${{github.sha}}
+
+  run-phpunit:
+    needs: [build-image, repository-name]
+    strategy:
+      matrix:
+        name: ["locked", "lowest", "highest"]
+    runs-on: ubuntu-latest
+    steps:
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run test
+        run: docker run --user root -v $PWD:/app/.output/ -e XDEBUG_MODE=coverage --rm ${{ needs.repository-name.outputs.slug}}/${{ matrix.name }}:${{github.sha}} vendor/bin/phpunit --coverage-php .output/coverage.cov
+      -
+        uses: actions/upload-artifact@v3
+        if: ${{ matrix.name == 'locked' }}
+        with:
+          if-no-files-found: error
+          name: phpunit-coverage-report-${{ matrix.name }}
+          path: coverage.cov
+
+  git-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - run: (git diff origin/main src > .output/patch.txt)
+      - uses: actions/upload-artifact@v3
+        with:
+          name: git-diff
+          path: .output/patch.txt
+
+  bc-brecks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: "Roave BC Check"
+        uses: "addnab/docker-run-action@v3"
+        with:
+          image: "nyholm/roave-bc-check-ga"
+          options: "--env GITHUB_REPOSITORY=${{ github.repository }} --user 1001 --volume ${{ github.workspace }}:/app"
+          run: "/entrypoint.sh"
+  run-coverage-check:
+    if: ${{ needs.changed.outputs.php }}
+    needs:
+      - changed
+      - run-phpunit
+      - git-diff
+    runs-on: ubuntu-latest
+    container:
+      image: fearofcode/phpcov:8
+      volumes:
+        - ${{github.WORKSPACE}}/:${{github.WORKSPACE}}
+      credentials:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: git-diff
+      - uses: actions/download-artifact@v2
+        with:
+          name: phpunit-coverage-report-locked
+      - run: (phpcov patch-coverage --path-prefix /app coverage.cov patch.txt)
+
+  run-psalm:
+    needs: [build-image, repository-name]
+    strategy:
+      matrix:
+        name: [ "locked", "lowest", "highest" ]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /app
+    container:
+      image: ${{ needs.repository-name.outputs.slug}}/${{ matrix.name }}:${{github.sha}}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: RUN psalm
+        run: (psalm)
